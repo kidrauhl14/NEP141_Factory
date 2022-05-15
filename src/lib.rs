@@ -21,17 +21,43 @@ use near_contract_standards::fungible_token::metadata::{
 use near_contract_standards::fungible_token::FungibleToken;
 use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
 use near_sdk::collections::LazyOption;
+use near_sdk::collections::LookupSet;
 use near_sdk::json_types::U128;
-use near_sdk::{env, log, near_bindgen, AccountId, Balance, PanicOnDefault, PromiseOrValue};
+use near_sdk::{env, ext_contract, log, near_bindgen, AccountId, Balance, PanicOnDefault, Promise, PromiseOrValue, PromiseResult, Gas};
+
+fn is_promise_success() -> bool {
+    assert_eq!(
+        env::promise_results_count(),
+        1,
+        "Contract expected a result on the callback"
+    );
+    match env::promise_result(0) {
+        PromiseResult::Successful(_) => true,
+        _ => false,
+    }
+}
 
 #[near_bindgen]
 #[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
 pub struct Contract {
+    owner_id: AccountId,
     token: FungibleToken,
     metadata: LazyOption<FungibleTokenMetadata>,
+    factory_whitelist: LookupSet<AccountId>,
 }
 
+const FT_TRANSFER_GAS: Gas = Gas(20_000_000_000_000);
 const DATA_IMAGE_SVG_NEAR_ICON: &str = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 288 288'%3E%3Cg id='l' data-name='l'%3E%3Cpath d='M187.58,79.81l-30.1,44.69a3.2,3.2,0,0,0,4.75,4.2L191.86,103a1.2,1.2,0,0,1,2,.91v80.46a1.2,1.2,0,0,1-2.12.77L102.18,77.93A15.35,15.35,0,0,0,90.47,72.5H87.34A15.34,15.34,0,0,0,72,87.84V201.16A15.34,15.34,0,0,0,87.34,216.5h0a15.35,15.35,0,0,0,13.08-7.31l30.1-44.69a3.2,3.2,0,0,0-4.75-4.2L96.14,186a1.2,1.2,0,0,1-2-.91V104.61a1.2,1.2,0,0,1,2.12-.77l89.55,107.23a15.35,15.35,0,0,0,11.71,5.43h3.13A15.34,15.34,0,0,0,216,201.16V87.84A15.34,15.34,0,0,0,200.66,72.5h0A15.35,15.35,0,0,0,187.58,79.81Z'/%3E%3C/g%3E%3C/svg%3E";
+const ADD_WHITELIST_CALLBACK_GAS: Gas = Gas(20_000_000_000_000);
+
+/// Indicates there are no deposit for a callback for better readability.
+const NO_DEPOSIT: u128 = 0;
+
+#[ext_contract(ext_self)]
+pub trait ExtCont {
+    /// Callback after creating account and claiming linkdrop.
+    fn add_whitelist(&mut self, account_id: AccountId) -> bool;
+}
 
 #[near_bindgen]
 impl Contract {
@@ -65,18 +91,49 @@ impl Contract {
         assert!(!env::state_exists(), "Already initialized");
         metadata.assert_valid();
         let mut this = Self {
+            owner_id,
             token: FungibleToken::new(b"a".to_vec()),
             metadata: LazyOption::new(b"m".to_vec(), Some(&metadata)),
+            factory_whitelist: LookupSet::new(b"f".to_vec()),
         };
-        this.token.internal_register_account(&owner_id);
-        this.token.internal_deposit(&owner_id, total_supply.into());
+        this.token.internal_register_account(&this.owner_id);
+        this.token.internal_deposit(&this.owner_id, total_supply.into());
         near_contract_standards::fungible_token::events::FtMint {
-            owner_id: &owner_id,
+            owner_id: &this.owner_id,
             amount: &total_supply,
             memo: Some("Initial tokens supply is minted"),
         }
         .emit();
         this
+    }
+
+    pub fn transfer(&mut self, receiver_id: AccountId, amount: Balance) ->  Promise {
+        assert_eq!(
+            env::predecessor_account_id(),
+            env::current_account_id(),
+            "Transfer only can come from the contract owner"
+        );
+        assert!(
+            env::is_valid_account_id(receiver_id.as_bytes()),
+            "Invalid account id"
+        );
+
+        Promise::new(self.owner_id.clone()).function_call(
+            (&"ft_transfer").to_string(),
+            format!(
+                "{{\"receiver_id\": \"{}\", \"amount\": \"{}\"}}",
+                receiver_id, amount
+            )
+            .into_bytes(),
+            1,
+            FT_TRANSFER_GAS,
+        ).then(ext_self::add_whitelist(
+            receiver_id, 
+            env::current_account_id(),
+            NO_DEPOSIT,
+            ADD_WHITELIST_CALLBACK_GAS,))
+
+        // self.add_whitelist(receiver_id)
     }
 
     fn on_account_closed(&mut self, account_id: AccountId, balance: Balance) {
@@ -85,6 +142,27 @@ impl Contract {
 
     fn on_tokens_burned(&mut self, account_id: AccountId, amount: Balance) {
         log!("Account @{} burned {}", account_id, amount);
+    }
+
+    fn add_whitelist(&mut self, account_id: AccountId) -> bool {
+        assert!(
+            env::is_valid_account_id(account_id.as_bytes()),
+            "The given account ID is invalid"
+        );
+
+        let creation_succeeded = is_promise_success();
+        if creation_succeeded {
+            self.factory_whitelist.insert(&account_id); // 여기서 실패해도 false
+        } // else 추가
+        creation_succeeded // transfer 실패하면 얘는 자연스럽게 false 
+    }
+
+    pub fn is_whitelisted(&self, account_id: AccountId) -> bool {
+        assert!(
+            env::is_valid_account_id(account_id.as_bytes()),
+            "The given account ID is invalid"
+        );
+        self.factory_whitelist.contains(&account_id)
     }
 }
 
