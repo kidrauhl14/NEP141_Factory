@@ -21,22 +21,49 @@ use near_contract_standards::fungible_token::metadata::{
 use near_contract_standards::fungible_token::FungibleToken;
 use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
 use near_sdk::collections::LazyOption;
+use near_sdk::collections::LookupSet;
 use near_sdk::json_types::U128;
-use near_sdk::{env, log, near_bindgen, AccountId, Balance, PanicOnDefault, PromiseOrValue};
+use near_sdk::serde_json::json;
+use near_sdk::{env, ext_contract, log, near_bindgen, AccountId, Balance, PanicOnDefault, Promise, PromiseOrValue, PromiseResult, Gas};
+
+fn is_promise_success() -> bool {
+    assert_eq!(
+        env::promise_results_count(),
+        1,
+        "Contract expected a result on the callback"
+    );
+    match env::promise_result(0) {
+        PromiseResult::Successful(_) => true,
+        _ => false,
+    }
+}
 
 #[near_bindgen]
 #[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
 pub struct Contract {
+    owner_id: AccountId,
     token: FungibleToken,
     metadata: LazyOption<FungibleTokenMetadata>,
+    whitelist: LookupSet<AccountId>,
 }
 
+const GAS_FOR_FT_TRANSFER_CALL: Gas = Gas(60_000_000_000_000);
+const GAS_FOR_ADD_WHITELIST_CALL: Gas = Gas(30_000_000_000_000);
 const DATA_IMAGE_SVG_NEAR_ICON: &str = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 288 288'%3E%3Cg id='l' data-name='l'%3E%3Cpath d='M187.58,79.81l-30.1,44.69a3.2,3.2,0,0,0,4.75,4.2L191.86,103a1.2,1.2,0,0,1,2,.91v80.46a1.2,1.2,0,0,1-2.12.77L102.18,77.93A15.35,15.35,0,0,0,90.47,72.5H87.34A15.34,15.34,0,0,0,72,87.84V201.16A15.34,15.34,0,0,0,87.34,216.5h0a15.35,15.35,0,0,0,13.08-7.31l30.1-44.69a3.2,3.2,0,0,0-4.75-4.2L96.14,186a1.2,1.2,0,0,1-2-.91V104.61a1.2,1.2,0,0,1,2.12-.77l89.55,107.23a15.35,15.35,0,0,0,11.71,5.43h3.13A15.34,15.34,0,0,0,216,201.16V87.84A15.34,15.34,0,0,0,200.66,72.5h0A15.35,15.35,0,0,0,187.58,79.81Z'/%3E%3C/g%3E%3C/svg%3E";
+
+// Indicates there are no deposit for a callback for better readability.
+const NO_DEPOSIT: u128 = 0;
+
+// 외부 컨트랙트 콜을 하기 위한 macro
+#[ext_contract(ext_whitelist)]
+pub trait ExtWhitelist {
+    // Callback after transferring token.
+    fn add_whitelist(&mut self, account_id: AccountId) -> bool;
+}
 
 #[near_bindgen]
 impl Contract {
-    /// Initializes the contract with the given total supply owned by the given `owner_id` with
-    /// default metadata (for example purposes only).
+    // 테스트용 init
     #[init]
     pub fn new_default_meta(owner_id: AccountId, total_supply: U128) -> Self {
         Self::new(
@@ -54,8 +81,7 @@ impl Contract {
         )
     }
 
-    /// Initializes the contract with the given total supply owned by the given `owner_id` with
-    /// the given fungible token metadata.
+    // token 정보 초기화
     #[init]
     pub fn new(
         owner_id: AccountId,
@@ -63,20 +89,67 @@ impl Contract {
         metadata: FungibleTokenMetadata,
     ) -> Self {
         assert!(!env::state_exists(), "Already initialized");
+        assert_eq!(
+            env::predecessor_account_id(),
+            env::current_account_id(),
+            "Initialization only can come from the contract owner"
+        );
+
         metadata.assert_valid();
+
         let mut this = Self {
+            owner_id,
             token: FungibleToken::new(b"a".to_vec()),
             metadata: LazyOption::new(b"m".to_vec(), Some(&metadata)),
+            whitelist: LookupSet::new(b"f".to_vec()),
         };
-        this.token.internal_register_account(&owner_id);
-        this.token.internal_deposit(&owner_id, total_supply.into());
+
+        this.token.internal_register_account(&this.owner_id);
+        this.token.internal_deposit(&this.owner_id, total_supply.into());
+
         near_contract_standards::fungible_token::events::FtMint {
-            owner_id: &owner_id,
+            owner_id: &this.owner_id,
             amount: &total_supply,
             memo: Some("Initial tokens supply is minted"),
         }
         .emit();
         this
+    }
+
+    // token transfer
+    pub fn transfer(&mut self, receiver_id: AccountId, amount: Balance) ->  Promise {
+        // contract owner만 실행 가능
+        assert_eq!(
+            env::predecessor_account_id(),
+            env::current_account_id(),
+            "Transfer only can come from the contract owner"
+        );
+        assert!(
+            env::is_valid_account_id(receiver_id.as_bytes()),
+            "Invalid account id"
+        );
+
+        // debugging
+        log!("Prepaid gas - {}", format!("{:?}", env::prepaid_gas()));
+        log!("Used gas - {}", format!("{:?}", env::used_gas()));
+        log!("Execute Promise - receiver: {} amount: {}", receiver_id, amount); // bob
+        
+        // transfer 성공 -> whitelist에 추가
+        Promise::new(self.owner_id.clone()).function_call(
+            (&"ft_transfer").to_string(),
+            json!({
+                "receiver_id": receiver_id,
+                "amount": amount.to_string()
+            })
+            .to_string()
+            .into_bytes(),
+            1,
+            GAS_FOR_FT_TRANSFER_CALL,
+        ).then(ext_whitelist::add_whitelist(
+            receiver_id, 
+            env::current_account_id(),
+            NO_DEPOSIT,
+            GAS_FOR_ADD_WHITELIST_CALL,))
     }
 
     fn on_account_closed(&mut self, account_id: AccountId, balance: Balance) {
@@ -85,6 +158,34 @@ impl Contract {
 
     fn on_tokens_burned(&mut self, account_id: AccountId, amount: Balance) {
         log!("Account @{} burned {}", account_id, amount);
+    }
+
+    fn add_whitelist(&mut self, account_id: AccountId) -> bool {
+        // debugging
+        log!("PromiseResult - {:?}", env::promise_result(0)); // add_whitelist 단독으로 실행되면 에러
+        log!("*Execute add_whitelist - account id: {}", account_id);
+        log!("*Prepaid gas - {}", format!("{:?}", env::prepaid_gas()));
+        log!("*Used gas - {}", format!("{:?}", env::used_gas()));
+
+        assert!(
+            env::is_valid_account_id(account_id.as_bytes()),
+            "The given account ID is invalid"
+        );
+
+        let creation_succeeded = is_promise_success();
+        if creation_succeeded {
+            self.whitelist.insert(&account_id); // 여기서 실패해도 false
+        } // else 추가
+        creation_succeeded // transfer 실패하면 얘는 자연스럽게 false 
+    }
+
+    // whitelist 확인
+    pub fn is_whitelisted(&self, account_id: AccountId) -> bool {
+        assert!(
+            env::is_valid_account_id(account_id.as_bytes()),
+            "The given account ID is invalid"
+        );
+        self.whitelist.contains(&account_id)
     }
 }
 
@@ -100,7 +201,7 @@ impl FungibleTokenMetadataProvider for Contract {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
-    use near_sdk::test_utils::{accounts, VMContextBuilder};
+    use near_sdk::test_utils::{accounts, VMContextBuilder, get_created_receipts};
     use near_sdk::MockedBlockchain;
     use near_sdk::{testing_env, Balance};
 
@@ -133,6 +234,48 @@ mod tests {
         let context = get_context(accounts(1));
         testing_env!(context.build());
         let _contract = Contract::default();
+    }
+
+    #[test]
+    fn test_new_transfer() {
+        let mut context = get_context(accounts(0));
+        // log!("0번 - {}", accounts(0)); // signer = predecessor = owner // alice
+        // log!("1번 - {}", accounts(1)); // receiver // bob
+
+        testing_env!(context.build());
+        let mut contract = Contract::new_default_meta(accounts(0).into(), TOTAL_SUPPLY.into());
+        testing_env!(context
+            .storage_usage(env::storage_usage())
+            .attached_deposit(contract.storage_balance_bounds().min.into())
+            .predecessor_account_id(accounts(1))
+            .build());
+        // Paying for account registration, aka storage deposit
+        contract.storage_deposit(None, None);
+
+        testing_env!(context
+            .storage_usage(env::storage_usage())
+            .attached_deposit(1)
+            .predecessor_account_id(accounts(0))
+            .build());
+
+        let transfer_amount = TOTAL_SUPPLY / 2;
+        contract.transfer(accounts(1), transfer_amount.into());
+        
+        log!("**Prepaid gas - {}", format!("{:?}", env::prepaid_gas()));
+        log!("**Used gas - {}", format!("{:?}", env::used_gas()));
+        // contract.add_whitelist(accounts(1));
+        // log!("PromiseResult - {:?}", env::promise_result(0));
+        log!("Receipt - {:?}", get_created_receipts());
+        // log!("Logs - {:?}", get_logs());
+
+        testing_env!(context
+            .storage_usage(env::storage_usage())
+            .account_balance(env::account_balance())
+            .is_view(true)
+            .attached_deposit(0)
+            .build());
+        assert_eq!(contract.ft_balance_of(accounts(0)).0, (TOTAL_SUPPLY - transfer_amount));
+        assert_eq!(contract.ft_balance_of(accounts(1)).0, transfer_amount);
     }
 
     #[test]
