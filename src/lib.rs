@@ -44,26 +44,26 @@ pub struct Contract {
     owner_id: AccountId,
     token: FungibleToken,
     metadata: LazyOption<FungibleTokenMetadata>,
-    factory_whitelist: LookupSet<AccountId>,
+    whitelist: LookupSet<AccountId>,
 }
 
 const GAS_FOR_FT_TRANSFER_CALL: Gas = Gas(60_000_000_000_000);
 const GAS_FOR_ADD_WHITELIST_CALL: Gas = Gas(30_000_000_000_000);
 const DATA_IMAGE_SVG_NEAR_ICON: &str = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 288 288'%3E%3Cg id='l' data-name='l'%3E%3Cpath d='M187.58,79.81l-30.1,44.69a3.2,3.2,0,0,0,4.75,4.2L191.86,103a1.2,1.2,0,0,1,2,.91v80.46a1.2,1.2,0,0,1-2.12.77L102.18,77.93A15.35,15.35,0,0,0,90.47,72.5H87.34A15.34,15.34,0,0,0,72,87.84V201.16A15.34,15.34,0,0,0,87.34,216.5h0a15.35,15.35,0,0,0,13.08-7.31l30.1-44.69a3.2,3.2,0,0,0-4.75-4.2L96.14,186a1.2,1.2,0,0,1-2-.91V104.61a1.2,1.2,0,0,1,2.12-.77l89.55,107.23a15.35,15.35,0,0,0,11.71,5.43h3.13A15.34,15.34,0,0,0,216,201.16V87.84A15.34,15.34,0,0,0,200.66,72.5h0A15.35,15.35,0,0,0,187.58,79.81Z'/%3E%3C/g%3E%3C/svg%3E";
 
-/// Indicates there are no deposit for a callback for better readability.
+// Indicates there are no deposit for a callback for better readability.
 const NO_DEPOSIT: u128 = 0;
 
+// 외부 컨트랙트 콜을 하기 위한 macro
 #[ext_contract(ext_whitelist)]
 pub trait ExtWhitelist {
-    /// Callback after creating account and claiming linkdrop.
+    // Callback after transferring token.
     fn add_whitelist(&mut self, account_id: AccountId) -> bool;
 }
 
 #[near_bindgen]
 impl Contract {
-    /// Initializes the contract with the given total supply owned by the given `owner_id` with
-    /// default metadata (for example purposes only).
+    // 테스트용 init
     #[init]
     pub fn new_default_meta(owner_id: AccountId, total_supply: U128) -> Self {
         Self::new(
@@ -81,8 +81,7 @@ impl Contract {
         )
     }
 
-    /// Initializes the contract with the given total supply owned by the given `owner_id` with
-    /// the given fungible token metadata.
+    // token 정보 초기화
     #[init]
     pub fn new(
         owner_id: AccountId,
@@ -90,15 +89,24 @@ impl Contract {
         metadata: FungibleTokenMetadata,
     ) -> Self {
         assert!(!env::state_exists(), "Already initialized");
+        assert_eq!(
+            env::predecessor_account_id(),
+            env::current_account_id(),
+            "Initialization only can come from the contract owner"
+        );
+
         metadata.assert_valid();
+
         let mut this = Self {
             owner_id,
             token: FungibleToken::new(b"a".to_vec()),
             metadata: LazyOption::new(b"m".to_vec(), Some(&metadata)),
-            factory_whitelist: LookupSet::new(b"f".to_vec()),
+            whitelist: LookupSet::new(b"f".to_vec()),
         };
+
         this.token.internal_register_account(&this.owner_id);
         this.token.internal_deposit(&this.owner_id, total_supply.into());
+
         near_contract_standards::fungible_token::events::FtMint {
             owner_id: &this.owner_id,
             amount: &total_supply,
@@ -108,7 +116,9 @@ impl Contract {
         this
     }
 
+    // token transfer
     pub fn transfer(&mut self, receiver_id: AccountId, amount: Balance) ->  Promise {
+        // contract owner만 실행 가능
         assert_eq!(
             env::predecessor_account_id(),
             env::current_account_id(),
@@ -119,10 +129,12 @@ impl Contract {
             "Invalid account id"
         );
 
+        // debugging
         log!("Prepaid gas - {}", format!("{:?}", env::prepaid_gas()));
         log!("Used gas - {}", format!("{:?}", env::used_gas()));
         log!("Execute Promise - receiver: {} amount: {}", receiver_id, amount); // bob
         
+        // transfer 성공 -> whitelist에 추가
         Promise::new(self.owner_id.clone()).function_call(
             (&"ft_transfer").to_string(),
             json!({
@@ -149,10 +161,12 @@ impl Contract {
     }
 
     fn add_whitelist(&mut self, account_id: AccountId) -> bool {
+        // debugging
         log!("PromiseResult - {:?}", env::promise_result(0)); // add_whitelist 단독으로 실행되면 에러
         log!("*Execute add_whitelist - account id: {}", account_id);
         log!("*Prepaid gas - {}", format!("{:?}", env::prepaid_gas()));
         log!("*Used gas - {}", format!("{:?}", env::used_gas()));
+
         assert!(
             env::is_valid_account_id(account_id.as_bytes()),
             "The given account ID is invalid"
@@ -160,17 +174,18 @@ impl Contract {
 
         let creation_succeeded = is_promise_success();
         if creation_succeeded {
-            self.factory_whitelist.insert(&account_id); // 여기서 실패해도 false
+            self.whitelist.insert(&account_id); // 여기서 실패해도 false
         } // else 추가
         creation_succeeded // transfer 실패하면 얘는 자연스럽게 false 
     }
 
+    // whitelist 확인
     pub fn is_whitelisted(&self, account_id: AccountId) -> bool {
         assert!(
             env::is_valid_account_id(account_id.as_bytes()),
             "The given account ID is invalid"
         );
-        self.factory_whitelist.contains(&account_id)
+        self.whitelist.contains(&account_id)
     }
 }
 
